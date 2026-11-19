@@ -1,0 +1,45 @@
+# Full local stack: an in-memory devnet, the Penny contract and the web app.
+# Uses Hardhat's public test accounts, which hold no real value.
+x-penny-address: &penny-address "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+
+services:
+  chain:
+    build: ./contracts
+    command: npx hardhat node --hostname 0.0.0.0
+    ports:
+      - "8545:8545"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8545',{method:'POST',headers:{'content-type':'application/json'},body:'{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_chainId\",\"params\":[]}'}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 2s
+      retries: 30
+
+  deploy:
+    build: ./contracts
+    command: npx hardhat run scripts/deploy.js --network devnet
+    environment:
+      DEVNET_RPC_URL: http://chain:8545
+      SKIP_IF_DEPLOYED_AT: *penny-address
+    depends_on:
+      chain:
+        condition: service_healthy
+
+  web:
+    build: ./web
+    ports:
+      - "3000:3000"
+    environment:
+      RPC_URL: http://chain:8545
+      CHAIN_ID: "31337"
+      EXPLORER_URL: ""
+      PENNY_CONTRACT_ADDRESS: *penny-address
+      TREASURY_PRIVATE_KEY: "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+      WELCOME_BONUS: "100"
+    tmpfs:
+      - /data:uid=1000,gid=1000
+    depends_on:
+      deploy:
+        condition: service_completed_successfully
