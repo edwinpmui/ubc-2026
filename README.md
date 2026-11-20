@@ -37,7 +37,7 @@ Arc uses USDC as its native gas token, which is why the product works the way it
 | `cancelLink(claimKey)` | The sender can refund at any time; after expiry, anyone can trigger the refund to the sender |
 | `createSplit(debtors, amounts, memo)` / `paySplit(id)` | Records who owes what and forwards each share to the creator |
 
-**Contract address (Arc Testnet):** `PENNY_CONTRACT_ADDRESS` ← *fill in after deploying (see below)*
+**Contract address (Arc Testnet):** [`0x1Fa7046C4A95Bd4F15Ee09208207A40F3f60bccc`](https://testnet.arcscan.app/address/0x1Fa7046C4A95Bd4F15Ee09208207A40F3f60bccc)
 
 Chain: Arc Testnet · chain ID `5042002` · RPC `https://rpc.testnet.arc.network` · explorer [testnet.arcscan.app](https://testnet.arcscan.app)
 
