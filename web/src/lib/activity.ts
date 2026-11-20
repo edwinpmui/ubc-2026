@@ -26,6 +26,10 @@ export function describeActivity(a: Activity, viewerId: string, users: Map<strin
       return outgoing
         ? { title: `You paid ${to?.name ?? "someone"} your share`, counterparty: to, direction: "out" }
         : { title: `${from?.name ?? "Someone"} paid their share`, counterparty: from, direction: "in" };
+    case "group_settled":
+      return outgoing
+        ? { title: `You settled up with ${to?.name ?? "someone"}`, counterparty: to, direction: "out" }
+        : { title: `${from?.name ?? "Someone"} settled up with you`, counterparty: from, direction: "in" };
     default:
       return outgoing
         ? { title: `You paid ${to?.name ?? "someone"}`, counterparty: to, direction: "out" }

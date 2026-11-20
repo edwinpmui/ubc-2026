@@ -16,7 +16,16 @@ import { decryptKey, encryptKey, hashPassword, verifyPassword } from "./crypto";
 import { read, write } from "./db";
 import { AppError } from "./errors";
 import { venmoInstantFee } from "./format";
-import type { Activity, PayLink, PublicUser, Split, User } from "./types";
+import {
+  fromCents,
+  netBalances,
+  resolveSplit,
+  simplifyDebts,
+  toCents,
+  type Portion,
+  type SplitMode,
+} from "./ledger";
+import type { Activity, Group, GroupExpense, PayLink, PublicUser, Split, User } from "./types";
 
 const HANDLE_PATTERN = /^[a-z0-9_]{3,20}$/;
 const AMOUNT_PATTERN = /^\d{1,6}(\.\d{1,2})?$/;
@@ -396,7 +405,7 @@ export function activityFor(user: User) {
 export function statsFor(user: User) {
   const activity = activityFor(user);
   const received = activity.filter(
-    (a) => a.toId === user.id && ["payment", "link_claimed", "split_paid"].includes(a.kind),
+    (a) => a.toId === user.id && ["payment", "link_claimed", "split_paid", "group_settled"].includes(a.kind),
   );
   const feesAvoided = received.reduce((sum, a) => sum + venmoInstantFee(Number(a.amount)), 0);
   const avgSettleMs = activity.length ? activity.reduce((sum, a) => sum + a.settleMs, 0) / activity.length : 0;
@@ -421,4 +430,286 @@ export function splitsFor(user: User) {
 
 export function linksFor(user: User) {
   return read((db) => db.links.filter((l) => l.senderId === user.id).sort((a, b) => b.createdAt - a.createdAt));
+}
+
+// ---------------------------------------------------------------------------
+// Groups: shared expenses with multiple payers, partial participation and
+// minimal settle-up. Expenses live offchain (free to add and edit); settling
+// up is a real onchain `pay()` from each debtor straight to their creditor.
+// ---------------------------------------------------------------------------
+
+const settling = new Set<string>();
+
+function requireMember(user: User, groupId: string) {
+  const group = read((db) => db.groups.find((g) => g.id === groupId));
+  if (!group || !group.memberIds.includes(user.id)) throw new AppError("We couldn't find that group.", 404);
+  return group;
+}
+
+function updateGroup(groupId: string, fn: (group: Group) => void) {
+  write((db) => {
+    const group = db.groups.find((g) => g.id === groupId);
+    if (!group) throw new AppError("We couldn't find that group.", 404);
+    fn(group);
+  });
+}
+
+export function groupSummary(group: Group) {
+  const balances = netBalances(group.memberIds, group.expenses, group.settlements);
+  const plan = simplifyDebts(balances);
+  const totalCents = group.expenses.reduce((sum, e) => sum + e.totalCents, 0);
+  return { balances, plan, totalCents, settled: group.expenses.length > 0 && plan.length === 0 };
+}
+
+export function groupsFor(user: User) {
+  return read((db) =>
+    db.groups.filter((g) => g.memberIds.includes(user.id)).sort((a, b) => b.createdAt - a.createdAt),
+  );
+}
+
+export function groupFor(user: User, groupId: string) {
+  return requireMember(user, groupId);
+}
+
+export function createGroup(user: User, input: { name: string; handles: string[] }) {
+  const name = cleanMemo(input.name).slice(0, 60);
+  if (!name) throw new AppError("Name the group, like “Whistler trip”.");
+  const memberIds = [user.id];
+  for (const handle of Array.isArray(input.handles) ? input.handles : []) {
+    const member = findByHandle(handle ?? "");
+    if (!member) throw new AppError(`We couldn't find @${normalizeHandle(handle ?? "")}.`);
+    if (!memberIds.includes(member.id)) memberIds.push(member.id);
+  }
+  if (memberIds.length < 2) throw new AppError("Add at least one friend.");
+
+  const group: Group = {
+    id: randomUUID(),
+    name,
+    creatorId: user.id,
+    memberIds,
+    expenses: [],
+    settlements: [],
+    createdAt: Date.now(),
+  };
+  write((db) => db.groups.push(group));
+  return group;
+}
+
+export function addGroupMember(user: User, groupId: string, handle: string) {
+  requireMember(user, groupId);
+  const member = findByHandle(handle ?? "");
+  if (!member) throw new AppError(`We couldn't find @${normalizeHandle(handle ?? "")}.`);
+  updateGroup(groupId, (group) => {
+    if (group.memberIds.includes(member.id)) throw new AppError(`@${member.handle} is already in the group.`);
+    group.memberIds.push(member.id);
+  });
+  return publicUser(member);
+}
+
+export interface ExpenseInput {
+  description: string;
+  total: string;
+  paidBy: { userId: string; amount: string }[];
+  mode: SplitMode;
+  splitAmong: { userId: string; value?: string }[];
+}
+
+/**
+ * Removed members keep their place in old expenses, so any change must leave them square.
+ * Otherwise they'd owe (or be owed) money in a group they can no longer see.
+ */
+function assertFormerMembersSquare(group: Group) {
+  const { balances } = groupSummary(group);
+  for (const [id, cents] of balances) {
+    if (!group.memberIds.includes(id) && cents !== 0) {
+      throw new AppError(`That would change the balance of ${findUser(id)?.name ?? "someone"}, who has left the group.`);
+    }
+  }
+}
+
+function requireExpenseEditor(user: User, group: Group, expenseId: string) {
+  const expense = group.expenses.find((e) => e.id === expenseId);
+  if (!expense) throw new AppError("That expense is already gone.", 404);
+  if (expense.addedById !== user.id && group.creatorId !== user.id) {
+    throw new AppError("Only whoever added it (or the group owner) can change it.", 403);
+  }
+  return expense;
+}
+
+export function addGroupExpense(user: User, groupId: string, input: ExpenseInput) {
+  const group = requireMember(user, groupId);
+  const expense: GroupExpense = {
+    id: randomUUID(),
+    ...buildExpense(group, input),
+    addedById: user.id,
+    createdAt: Date.now(),
+  };
+  updateGroup(groupId, (g) => g.expenses.push(expense));
+  return expense;
+}
+
+export function updateGroupExpense(user: User, groupId: string, expenseId: string, input: ExpenseInput) {
+  const group = requireMember(user, groupId);
+  const existing = requireExpenseEditor(user, group, expenseId);
+  const updated: GroupExpense = { ...existing, ...buildExpense(group, input, existing), editedAt: Date.now() };
+  if (!updated.weights) delete updated.weights;
+  assertFormerMembersSquare({ ...group, expenses: group.expenses.map((e) => (e.id === expenseId ? updated : e)) });
+  updateGroup(groupId, (g) => {
+    g.expenses = g.expenses.map((e) => (e.id === expenseId ? updated : e));
+  });
+  return updated;
+}
+
+/** `existing` lets an edit keep people who have since left; assertFormerMembersSquare guards their balance. */
+function buildExpense(group: Group, input: ExpenseInput, existing?: GroupExpense) {
+  const description = cleanMemo(input.description).slice(0, 80);
+  if (!description) throw new AppError("What was it for? e.g. “Hotel”.");
+  const totalCents = toCents(requireAmount(input.total));
+  const allowed = new Set([
+    ...group.memberIds,
+    ...(existing ? [...existing.paidBy, ...existing.splitAmong].map((p) => p.userId) : []),
+  ]);
+  const isMember = (id: string) => allowed.has(id);
+
+  // Who paid: one or more members whose amounts add up to the total.
+  const payers = Array.isArray(input.paidBy) ? input.paidBy : [];
+  if (payers.length === 0) throw new AppError("Who paid?");
+  const paidBy: Portion[] = payers.map((p) => {
+    if (!isMember(p.userId)) throw new AppError("Everyone who paid must be in the group.");
+    return { userId: p.userId, cents: toCents(requireAmount(p.amount)) };
+  });
+  if (new Set(paidBy.map((p) => p.userId)).size !== paidBy.length) {
+    throw new AppError("Someone is listed as paying twice.");
+  }
+  const paidSum = paidBy.reduce((sum, p) => sum + p.cents, 0);
+  if (paidSum !== totalCents) {
+    throw new AppError(`Payments add up to $${fromCents(paidSum)}, not $${fromCents(totalCents)}.`);
+  }
+
+  // Who it's for: resolved to cents on the server so the client can't skew the math.
+  const mode: SplitMode = ["equal", "exact", "shares"].includes(input.mode) ? input.mode : "equal";
+  const among = Array.isArray(input.splitAmong) ? input.splitAmong : [];
+  if (among.some((p) => !isMember(p.userId))) throw new AppError("Everyone in the split must be in the group.");
+  const values = among.map((p) => (mode === "exact" ? toCents(requireAmount(p.value ?? "")) : Number(p.value)));
+  let splitAmong: Portion[];
+  try {
+    splitAmong = resolveSplit(totalCents, mode, among.map((p) => p.userId), values);
+  } catch (err) {
+    throw new AppError((err as Error).message);
+  }
+
+  return {
+    description,
+    totalCents,
+    paidBy,
+    splitMode: mode,
+    splitAmong,
+    weights: mode === "shares" ? Object.fromEntries(among.map((p, i) => [p.userId, values[i]])) : undefined,
+  };
+}
+
+export function deleteGroupExpense(user: User, groupId: string, expenseId: string) {
+  const group = requireMember(user, groupId);
+  requireExpenseEditor(user, group, expenseId);
+  assertFormerMembersSquare({ ...group, expenses: group.expenses.filter((e) => e.id !== expenseId) });
+  updateGroup(groupId, (g) => {
+    g.expenses = g.expenses.filter((e) => e.id !== expenseId);
+  });
+}
+
+/** The owner can remove anyone else; anyone but the owner can leave. Only people who are square can go. */
+export function removeGroupMember(user: User, groupId: string, memberId: string) {
+  const group = requireMember(user, groupId);
+  const leaving = memberId === user.id;
+  if (!group.memberIds.includes(memberId)) throw new AppError("They're not in this group.", 404);
+  if (memberId === group.creatorId) throw new AppError("The group owner can't leave their own group.");
+  if (!leaving && user.id !== group.creatorId) throw new AppError("Only the group owner can remove people.", 403);
+
+  const cents = groupSummary(group).balances.get(memberId) ?? 0;
+  if (cents !== 0) {
+    const who = leaving ? "You" : (findUser(memberId)?.name ?? "They");
+    const owes = leaving ? "owe" : "owes";
+    const gets = leaving ? "are owed" : "is owed";
+    throw new AppError(
+      `${who} ${cents < 0 ? owes : gets} $${fromCents(Math.abs(cents))}. Settle up first, then try again.`,
+    );
+  }
+  updateGroup(groupId, (g) => {
+    g.memberIds = g.memberIds.filter((id) => id !== memberId);
+  });
+}
+
+async function withSettleLock<T>(user: User, groupId: string, fn: () => Promise<T>) {
+  const lock = `${groupId}:${user.id}`;
+  if (settling.has(lock)) throw new AppError("You're already settling up. Hang tight.");
+  settling.add(lock);
+  try {
+    return await fn();
+  } finally {
+    settling.delete(lock);
+  }
+}
+
+/** One onchain `pay()` for one transfer in the plan, recorded in the activity feed and the group ledger. */
+async function payTransfer(user: User, group: Group, toId: string, cents: number) {
+  const recipient = findUser(toId);
+  if (!recipient) throw new AppError("We couldn't find that person.");
+  const amount = fromCents(cents);
+  const memo = cleanMemo(`${group.name} · settle up`);
+  const settled = await send(decryptKey(user.encryptedKey), {
+    to: contract(),
+    data: encodeFunctionData({ abi: pennyAbi, functionName: "pay", args: [recipient.address, memo] }),
+    value: toWei(amount),
+  });
+  const activity = record(
+    { kind: "group_settled", fromId: user.id, toId, amount, memo, sponsored: false, ref: `group:${group.id}` },
+    settled,
+  );
+  updateGroup(group.id, (g) =>
+    g.settlements.push({ id: randomUUID(), fromId: user.id, toId, cents, activityId: activity.id, createdAt: Date.now() }),
+  );
+  return activity;
+}
+
+export async function settleGroupDebt(user: User, groupId: string, toId: string) {
+  return withSettleLock(user, groupId, async () => {
+    const group = requireMember(user, groupId);
+    const transfer = groupSummary(group).plan.find((t) => t.fromId === user.id && t.toId === toId);
+    if (!transfer) throw new AppError("You don't owe them anything right now.");
+    await ensureFunds(user, fromCents(transfer.cents));
+    return payTransfer(user, group, toId, transfer.cents);
+  });
+}
+
+/**
+ * Pay everyone you owe in the group, one onchain payment each. Funds are checked for the full amount
+ * first so a settle-up doesn't stop halfway for lack of money. A single payment returns its activity
+ * (so the client can show the receipt); several return a summary.
+ */
+export async function settleAllGroupDebts(user: User, groupId: string) {
+  return withSettleLock(user, groupId, async () => {
+    const group = requireMember(user, groupId);
+    const mine = groupSummary(group).plan.filter((t) => t.fromId === user.id);
+    if (mine.length === 0) throw new AppError("You don't owe anyone in this group.");
+    const totalCents = mine.reduce((sum, t) => sum + t.cents, 0);
+    await ensureFunds(user, fromCents(totalCents));
+
+    const paid: Activity[] = [];
+    for (const t of mine) {
+      try {
+        paid.push(await payTransfer(user, group, t.toId, t.cents));
+      } catch (err) {
+        if (paid.length === 0) throw err;
+        const done = paid.map((a) => `$${a.amount} to ${findUser(a.toId ?? "")?.name ?? "someone"}`).join(", ");
+        throw new AppError(`Paid ${done}, but the next payment failed. Tap Settle up again to finish.`);
+      }
+    }
+    if (paid.length === 1) return paid[0];
+    return {
+      count: paid.length,
+      amount: fromCents(totalCents),
+      settleMs: paid.reduce((sum, a) => sum + a.settleMs, 0),
+      feeUsd: paid.reduce((sum, a) => sum + a.feeUsd, 0),
+    };
+  });
 }

@@ -6,7 +6,7 @@ import type { Database } from "./types";
 const file = path.join(config.dataDir, "db.json");
 
 function empty(): Database {
-  return { users: [], activity: [], requests: [], links: [], splits: [] };
+  return { users: [], activity: [], requests: [], links: [], splits: [], groups: [] };
 }
 
 function load(): Database {

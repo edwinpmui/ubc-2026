@@ -17,6 +17,7 @@ Penny is a Venmo-style P2P payments app. It feels like the apps people already u
 - **Real receipts.** Every receipt shows the *measured* settle time (submit → confirmed), the exact network fee paid in USDC, and the Venmo comparison, with a link to the transaction on the explorer.
 - **Pay links.** Send money to anyone with a link, even if they aren't on Penny. The claim key is generated in the sender's browser and lives only in the URL fragment, so the server never sees it. The recipient signs up in about 10 seconds and claims for free (Penny relays the claim and covers the fee). Unclaimed money can be refunded by the sender, and anyone can trigger the refund after 7 days.
 - **Bill splits.** Split evenly or with custom amounts. The split and each person's share are recorded onchain. Everyone pays their share in one tap and the creator watches a progress bar fill up.
+- **Groups for trips and shared houses.** Log expenses as they happen: several people can pay for one bill, anyone can be left out of an expense, and costs split equally, by exact amounts, or by shares. Penny keeps a running net balance for everyone and works out the fewest payments to square up (at most n − 1, instead of everyone paying everyone). Expenses are offchain, so logging them is free; each settle-up is a real onchain payment straight to the person you owe.
 - **No-crypto onboarding.** Signing up creates an embedded wallet and drops in a welcome bonus. Fees come out of the same USDC balance, because on Arc USDC *is* the gas token.
 - **Your stats.** The home screen tracks the fees you skipped compared with Venmo Instant Transfer and your average settle time.
 - **Pay-me QR.** Every profile has a QR code and link that opens the Pay screen with you already filled in.
@@ -45,7 +46,8 @@ Chain: Arc Testnet · chain ID `5042002` · RPC `https://rpc.testnet.arc.network
 
 ```
 web/        Next.js 15 (App Router) + Tailwind v4 + viem
-  src/lib/services.ts   business logic: signup, pay, requests, links, splits
+  src/lib/services.ts   business logic: signup, pay, requests, links, splits, groups
+  src/lib/ledger.ts     group math: split resolution, net balances, debt simplification (pure, unit-tested)
   src/lib/chain.ts      viem clients, tx sending with settle-time measurement, revert decoding
   src/app/(app)/        logged-in screens: home, pay, receipt, splits, links, me
   src/app/claim/        public pay-link claim page (keys stay client-side)
@@ -84,6 +86,14 @@ This starts an in-memory devnet, deploys `Penny.sol`, and serves the app at **ht
 
 ```bash
 docker build -t penny-contracts ./contracts && docker run --rm penny-contracts
+```
+
+### Group ledger tests
+
+The balance and debt-simplification math (`web/src/lib/ledger.ts`) has no dependencies and runs on Node 22.6+:
+
+```bash
+cd web && npm test
 ```
 
 ## Caveats

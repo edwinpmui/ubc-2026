@@ -12,6 +12,8 @@ export function ActionButton({
   className = "btn-primary",
   toReceipt = false,
   pendingLabel = "Settling…",
+  confirm,
+  redirectTo,
 }: {
   url: string;
   payload?: unknown;
@@ -19,17 +21,23 @@ export function ActionButton({
   className?: string;
   toReceipt?: boolean;
   pendingLabel?: string;
+  /** Ask before running, e.g. for deletes. */
+  confirm?: string;
+  /** Navigate here on success instead of refreshing the current page. */
+  redirectTo?: string;
 }) {
   const router = useRouter();
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
 
   async function run() {
+    if (confirm && !window.confirm(confirm)) return;
     setPending(true);
     setError("");
     try {
       const result = await postJson<{ id?: string }>(url, payload);
       if (toReceipt && result.id) router.push(`/receipt/${result.id}`);
+      else if (redirectTo) router.push(redirectTo);
       else router.refresh();
     } catch (err) {
       setError((err as Error).message);
